@@ -19,7 +19,7 @@
 
 1. 安装 **Node.js >= 18**
 2. 安装 Claude Desktop（AUR `claude-desktop` / 官方 `.deb` / 其它打包均可，脚本会自动寻找 `resources/app.asar`）
-3. （可选）在 `~/.claude/settings.json` 里配置好 Claude Code CLI 的端点，脚本会直接复用：
+3. （可选）配置好端点，脚本 `--from-cli` 会直接复用。读取顺序：**运行时环境变量 > `~/.claude/settings.json` 的 `env`**：
    ```json
    {
      "env": {
@@ -29,7 +29,9 @@
      }
    }
    ```
-   `ANTHROPIC_AUTH_TOKEN` → `Authorization: Bearer`；`ANTHROPIC_API_KEY` → `x-api-key` 头。
+   - `ANTHROPIC_BASE_URL`；`ANTHROPIC_AUTH_TOKEN` → `Authorization: Bearer`，`ANTHROPIC_API_KEY` → `x-api-key` 头
+   - 模型列表由 `ANTHROPIC_MODEL` 和 `ANTHROPIC_DEFAULT_{FABLE,OPUS,SONNET,HAIKU}_MODEL`（id）/ `..._MODEL_NAME`（显示名）组合而成，首项为默认模型
+   - id 带 `[1m]` 后缀（如 `claude-fable-5-1[1m]`）时会同时设置 `prefer1m: true`，默认选中 1M 上下文变体
 
 ## 快速开始
 

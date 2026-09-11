@@ -72,22 +72,53 @@ function sh(command, opts = {}) {
     return execSync(command, { stdio: 'pipe', encoding: 'utf-8', ...opts });
 }
 
-// ============ 读取 CLI 配置 ============
+// ============ 读取端点配置：运行时环境变量 > ~/.claude/settings.json 的 env ============
+const MODEL_TIERS = ['FABLE', 'OPUS', 'SONNET', 'HAIKU'];
+
+function mergedEnv() {
+    let fileEnv = {};
+    try { fileEnv = JSON.parse(fs.readFileSync(CLI_SETTINGS, 'utf-8')).env || {}; } catch {}
+    const env = { ...fileEnv };
+    for (const [k, v] of Object.entries(process.env)) {
+        if (/^(ANTHROPIC_|API_KEY$)/.test(k) && v !== undefined && v !== '') env[k] = v;
+    }
+    return env;
+}
+
+// ANTHROPIC_MODEL 与 ANTHROPIC_DEFAULT_<TIER>_MODEL(_NAME) → inferenceModels 列表（首项为默认模型）
+function modelsFromEnv(e) {
+    const list = [], seen = new Set();
+    // 带 [1m] 后缀的 id：应用会剥掉后缀并提供 1M 变体，这里同时把 1M 设为默认选项
+    const push = (id, label) => {
+        if (!id || seen.has(id)) return;
+        seen.add(id);
+        const entry = { name: id };
+        if (label && label !== id) entry.labelOverride = label;
+        if (/\[1m\]$/i.test(id)) entry.prefer1m = true;
+        list.push(Object.keys(entry).length === 1 ? id : entry);
+    };
+    push(e.ANTHROPIC_MODEL);
+    for (const t of MODEL_TIERS) {
+        const id = e[`ANTHROPIC_DEFAULT_${t}_MODEL`], label = e[`ANTHROPIC_DEFAULT_${t}_MODEL_NAME`];
+        push(id || label, label);
+    }
+    return list;
+}
+
 function readCli() {
-    if (!fs.existsSync(CLI_SETTINGS)) return null;
-    try {
-        const j = JSON.parse(fs.readFileSync(CLI_SETTINGS, 'utf-8'));
-        const e = j.env || {};
-        const token = e.ANTHROPIC_AUTH_TOKEN || null;
-        const apiKey = e.ANTHROPIC_API_KEY || e.API_KEY || null;
-        return {
-            url: e.ANTHROPIC_BASE_URL || null,
-            key: token || apiKey,
-            // ANTHROPIC_AUTH_TOKEN 对应 Authorization: Bearer，ANTHROPIC_API_KEY 对应 x-api-key
-            authScheme: token ? 'bearer' : (apiKey ? 'x-api-key' : 'bearer'),
-            model: e.ANTHROPIC_MODEL || null,
-        };
-    } catch { return null; }
+    const e = mergedEnv();
+    if (!Object.keys(e).length) return null;
+    const token = e.ANTHROPIC_AUTH_TOKEN || null;
+    const apiKey = e.ANTHROPIC_API_KEY || e.API_KEY || null;
+    const fromEnv = Object.keys(e).filter(k => process.env[k] !== undefined && process.env[k] !== '');
+    return {
+        url: e.ANTHROPIC_BASE_URL || null,
+        key: token || apiKey,
+        // ANTHROPIC_AUTH_TOKEN 对应 Authorization: Bearer，ANTHROPIC_API_KEY 对应 x-api-key
+        authScheme: token ? 'bearer' : (apiKey ? 'x-api-key' : 'bearer'),
+        models: modelsFromEnv(e),
+        source: fromEnv.length ? `env(${fromEnv.length} vars) + settings.json` : 'settings.json',
+    };
 }
 
 // ============ 查找官方安装 ============
@@ -231,7 +262,8 @@ const HTTP_PATCHES = [
 
 // 方案 3（实验性）：登录模式下的功能解锁。锚点用正则写，尽量跨版本。
 function fullPatches({ allFlags }) {
-    const cliEnvReader = `(function(){var _log=function(m){try{var _e=require("electron"),_fs=require("fs"),_p=require("path");var d=_p.join(_e.app.getPath("userData"),"logs");_fs.mkdirSync(d,{recursive:true});_fs.appendFileSync(_p.join(d,"patch.log"),new Date().toISOString()+" "+m+"\\n")}catch(e){}};try{var _fs=require("fs"),_p=require("path"),_h=process.env.HOME||"";var _f=_p.join(_h,".claude","settings.json");if(_fs.existsSync(_f)){var _c=JSON.parse(_fs.readFileSync(_f,"utf-8"));if(_c&&_c.env){_log("CLI env injected into Claude Code session: "+Object.keys(_c.env).join(", "));return _c.env}}}catch(_e){_log("read CLI settings failed: "+_e)}return{}})()`;
+    // 注入顺序：~/.claude/settings.json 的 env，再用桌面进程自身的 ANTHROPIC_* 运行时环境变量覆盖
+    const cliEnvReader = `(function(){var _log=function(m){try{var _e=require("electron"),_fs=require("fs"),_p=require("path");var d=_p.join(_e.app.getPath("userData"),"logs");_fs.mkdirSync(d,{recursive:true});_fs.appendFileSync(_p.join(d,"patch.log"),new Date().toISOString()+" "+m+"\\n")}catch(e){}};var _out={};try{var _fs=require("fs"),_p=require("path"),_h=process.env.HOME||"";var _f=_p.join(_h,".claude","settings.json");if(_fs.existsSync(_f)){var _c=JSON.parse(_fs.readFileSync(_f,"utf-8"));if(_c&&_c.env)Object.assign(_out,_c.env)}}catch(_e){_log("read CLI settings failed: "+_e)}try{Object.keys(process.env).forEach(function(k){if(/^(ANTHROPIC_|API_KEY$)/.test(k)&&process.env[k])_out[k]=process.env[k]})}catch(_e){}if(Object.keys(_out).length)_log("env injected into Claude Code session: "+Object.keys(_out).join(", "));return _out})()`;
 
     // 渲染进程里的 bootstrap 能力注入（沿用 Windows 版思路）：拦截 /api/bootstrap，把 seat_tier 改成 max 并补齐 capabilities
     const rendererHook = `(function(){try{if(window.__bsPatchInstalled)return"dup";window.__bsPatchInstalled=true;function fix(d){if(d&&d.account&&d.account.memberships){d.account.memberships.forEach(function(m){m.seat_tier="max";if(m.organization){var c=m.organization.capabilities||[];c=c.filter(function(x){return x!=="claude_pro"});["claude_max","code","cowork","operon","computer_use"].forEach(function(x){if(c.indexOf(x)===-1)c.push(x)});m.organization.capabilities=c;m.organization.billing_type="stripe_subscription"}})}return d}var _orig=window.fetch;window.fetch=function(){var a=Array.prototype.slice.call(arguments);var u=typeof a[0]==="string"?a[0]:(a[0]&&a[0].url?a[0].url:"");if(u.indexOf("/api/bootstrap")!==-1&&u.indexOf("/system_prompts")===-1){return _orig.apply(this,a).then(function(r){if(!r.ok)return r;return r.clone().text().then(function(t){try{return new Response(JSON.stringify(fix(JSON.parse(t))),{status:r.status,statusText:r.statusText,headers:{"content-type":"application/json"}})}catch(e){return r}})})}return _orig.apply(this,a)};function getQC(){var root=document.getElementById("root");if(!root)return null;var ck=Object.keys(root).find(function(k){return k.startsWith("__reactContainer")});if(!ck)return null;var qc=null;(function find(f,d){if(!f||d>50||qc)return;if(f.memoizedProps&&f.memoizedProps.client&&typeof f.memoizedProps.client.invalidateQueries==="function"){qc=f.memoizedProps.client;return}find(f.child,d+1);if(!qc)find(f.sibling,d)})(root[ck],0);return qc}var tries=0;(function retry(){var qc=getQC();if(qc){qc.getQueryCache().getAll().forEach(function(q){if(q.queryKey&&q.queryKey[0]==="current_account"&&q.state.data){qc.setQueryData(q.queryKey,fix(JSON.parse(JSON.stringify(q.state.data))))}});qc.invalidateQueries({queryKey:["current_account"]})}else if(++tries<8)setTimeout(retry,1500)})();return"ok"}catch(e){return"err:"+e.message}})()`;
@@ -408,6 +440,8 @@ function parseModels(v) {
     return s.split(',').map(x => x.trim()).filter(Boolean);
 }
 
+const modelId = m => typeof m === 'string' ? m : m.name;
+
 function isLoopbackUrl(url) {
     try { const h = new URL(url).hostname; return ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(h) || h.endsWith('.localhost'); } catch { return false; }
 }
@@ -532,8 +566,8 @@ function showStatus() {
 
     const cli = readCli();
     if (cli) {
-        hdr('===== CLI Config (~/.claude/settings.json) =====');
-        inf(`URL=${cli.url}  Key=${maskKey(cli.key)} (${cli.authScheme})  Model=${cli.model}`);
+        hdr(`===== Endpoint config (${cli.source}) =====`);
+        inf(`URL=${cli.url}  Key=${maskKey(cli.key)} (${cli.authScheme})  Models=${cli.models.length ? JSON.stringify(cli.models) : '(auto discovery)'}`);
     }
     const log = path.join(XDG_CONFIG, 'Claude-3p', 'logs', 'main.log');
     if (fs.existsSync(log)) inf(`3P log: ${log}`);
@@ -549,15 +583,15 @@ async function resolveEndpoint({ interactive, allowHttp }) {
     if (!url && (flag('--from-cli') || !interactive)) {
         if (!cli || !cli.url) { err('CLI config not found in ~/.claude/settings.json'); return null; }
         url = cli.url; key = cli.key; authScheme = authScheme || cli.authScheme;
-        if (!models && cli.model) models = [cli.model];
+        if (!models && cli.models.length) models = cli.models;
     }
     if (!url && interactive) {
         if (cli && cli.url) {
-            ok(`CLI config: ${cli.url} | ${maskKey(cli.key)} | ${cli.model || '(auto model discovery)'}`);
+            ok(`Detected (${cli.source}): ${cli.url} | ${maskKey(cli.key)} | ${cli.models.length ? cli.models.map(modelId).join(',') : '(auto model discovery)'}`);
             const ch = await ask('  Reuse? [Y/n] ');
             if (ch === '' || /^[Yy]/.test(ch)) {
                 url = cli.url; key = cli.key; authScheme = authScheme || cli.authScheme;
-                if (!models && cli.model) models = [cli.model];
+                if (!models && cli.models.length) models = cli.models;
             }
         }
         if (!url) {
@@ -587,6 +621,9 @@ function help() {
   ================================
   node setup.js config      [--from-cli | --url URL --key KEY] [--auth bearer|x-api-key] [--models a,b] [--system]
                             方案 1：仅写配置（默认用户级 ~/.config/Claude-3p/configLibrary，--system 写 /etc/claude-desktop）
+                            --from-cli 读取顺序：运行时环境变量 > ~/.claude/settings.json 的 env
+                              ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN (Bearer) / ANTHROPIC_API_KEY (x-api-key)
+                              ANTHROPIC_MODEL, ANTHROPIC_DEFAULT_{FABLE,OPUS,SONNET,HAIKU}_MODEL[_NAME] → 模型列表
   node setup.js http-patch  [同上] [--in-place]
                             方案 2：打补丁允许任意 HTTP 端点（默认生成 claude-portable/ 便携副本，--in-place 用 sudo 原地替换）
   node setup.js full-patch  [--in-place] [--all-flags]
@@ -661,8 +698,8 @@ async function main() {
         case 'full-patch': {
             hdr('===== 方案 3: Full patch (experimental, requires login) =====');
             const cli = readCli();
-            if (cli && cli.url) ok(`CLI env will be injected into Claude Code sessions: ${cli.url} | ${maskKey(cli.key)}`);
-            else wrn('No ~/.claude/settings.json env found; Claude Code sessions will use the official endpoint');
+            if (cli && cli.url) ok(`Env will be injected into Claude Code sessions (${cli.source}): ${cli.url} | ${maskKey(cli.key)}`);
+            else wrn('No ANTHROPIC_* env (runtime or ~/.claude/settings.json) found; Claude Code sessions will use the official endpoint');
             if (fs.existsSync(SYSTEM_FILE) || (readMeta() || {}).appliedId) wrn('A 3P config is present; remove it (uninstall) if you want the official login mode');
             killDesktop();
             if (!await buildPatched(fullPatches({ allFlags: flag('--all-flags') }), { inPlace })) { err('Patch failed'); process.exit(1); }
