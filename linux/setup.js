@@ -16,6 +16,7 @@
  *   node setup.js config      [--from-cli | --url URL --key KEY] [--models a,b] [--system]
  *   node setup.js http-patch  [--from-cli | --url URL --key KEY] [--models a,b] [--in-place] [--system]
  *   node setup.js full-patch  [--in-place] [--all-flags]
+ *   node setup.js patch-asar  --scheme http|full --in app.asar --out patched.asar
  *   node setup.js status
  *   node setup.js launch
  *   node setup.js uninstall   [--system]
@@ -175,7 +176,7 @@ function applyPatches(extractDir, patches) {
     const cache = new Map();
     const read = f => { if (!cache.has(f)) cache.set(f, fs.readFileSync(path.join(buildDir, f), 'utf-8')); return cache.get(f); };
     const dirty = new Set();
-    let applied = 0;
+    let applied = 0, missedRequired = false;
 
     for (const p of patches) {
         const targets = p.file === '*' ? jsFiles
@@ -205,10 +206,12 @@ function applyPatches(extractDir, patches) {
             hits = 1;
         }
         if (hits) { ok(`${p.name} (${hits})`); applied++; }
-        else (p.required ? err : wrn)(`MISS: ${p.name}`);
+        else if (p.required) { err(`MISS: ${p.name}`); missedRequired = true; }
+        else wrn(`MISS: ${p.name}`);
     }
     for (const f of dirty) fs.writeFileSync(path.join(buildDir, f), cache.get(f), 'utf-8');
     inf(`Patches: ${applied}/${patches.length} applied`);
+    if (missedRequired) return 0;
     return applied;
 }
 
@@ -282,8 +285,46 @@ function fullPatches({ allFlags }) {
     return patches;
 }
 
+// ============ 打补丁：任意 app.asar → 新 app.asar（+ .unpacked） ============
+// 对 srcAsar 解包、打补丁、按原 unpacked 目录结构重新打包到 outAsar，并解包核验。
+// unpackedRef：用于读取原 app.asar.unpacked 目录结构的 asar 路径（默认 srcAsar）。
+async function patchAsarFile(srcAsar, outAsar, patches, { unpackedRef } = {}) {
+    inf(`Extracting ${srcAsar}...`);
+    fs.rmSync(TMP, { recursive: true, force: true });
+    asar().extractAll(srcAsar, TMP);
+
+    const applied = applyPatches(TMP, patches);
+    if (!applied) { err('Required patch missed — app version probably changed'); fs.rmSync(TMP, { recursive: true, force: true }); return false; }
+
+    fs.rmSync(outAsar, { force: true });
+    fs.rmSync(outAsar + '.unpacked', { recursive: true, force: true });
+    fs.mkdirSync(path.dirname(outAsar), { recursive: true });
+    const dirs = unpackedDirs(unpackedRef || srcAsar);
+    const unpackDir = dirs.length > 1 ? `{${dirs.join(',')}}` : dirs[0];
+    inf('Repacking app.asar...');
+    await asar().createPackageWithOptions(TMP, outAsar, unpackDir ? { unpackDir } : {});
+    fs.rmSync(TMP, { recursive: true, force: true });
+
+    // 核验：必需补丁的原文不应再出现
+    const check = patches.find(p => p.required) || patches.find(p => p.find);
+    if (check && check.find) {
+        const vdir = path.join(HERE, '_verify_tmp');
+        fs.rmSync(vdir, { recursive: true, force: true });
+        asar().extractAll(outAsar, vdir);
+        const build = path.join(vdir, '.vite', 'build');
+        const still = fs.readdirSync(build).filter(f => f.endsWith('.js')).some(f => {
+            const c = fs.readFileSync(path.join(build, f), 'utf-8');
+            return check.find instanceof RegExp ? new RegExp(check.find.source).test(c) : c.includes(check.find);
+        });
+        fs.rmSync(vdir, { recursive: true, force: true });
+        if (still) { err('Verification failed: original code still present'); return false; }
+        ok('Verified');
+    }
+    return true;
+}
+
 // ============ 构建：便携副本 或 原地替换 ============
-function buildPatched(patches, { inPlace }) {
+async function buildPatched(patches, { inPlace }) {
     if (!OFFICIAL_DIR || !OFFICIAL_BIN) { err('Official Claude Desktop not found (looked for resources/app.asar next to the binary)'); return false; }
     inf(`Official: ${OFFICIAL_DIR} (v${readAppVersion(OFFICIAL_ASAR)})`);
 
@@ -292,65 +333,34 @@ function buildPatched(patches, { inPlace }) {
     const backup = OFFICIAL_ASAR + '.orig';
     if (inPlace && fs.existsSync(backup)) srcAsar = backup;
 
-    inf('Extracting app.asar...');
-    fs.rmSync(TMP, { recursive: true, force: true });
-    asar().extractAll(srcAsar, TMP);
-
-    const applied = applyPatches(TMP, patches);
-    if (!applied) { err('No patch applied — app version probably changed'); fs.rmSync(TMP, { recursive: true, force: true }); return false; }
-
     const outAsar = path.join(HERE, '_patched.asar');
+    if (!await patchAsarFile(srcAsar, outAsar, patches, { unpackedRef: OFFICIAL_ASAR })) return false;
+
+    let targetDir;
+    if (inPlace) {
+        targetDir = OFFICIAL_DIR;
+        inf('Installing in place (sudo)...');
+        const cmds = [];
+        if (!fs.existsSync(backup)) cmds.push(`cp -a "${OFFICIAL_ASAR}" "${backup}"`);
+        cmds.push(`install -m 644 "${outAsar}" "${OFFICIAL_ASAR}"`);
+        cmds.push(`rm -rf "${OFFICIAL_ASAR}.unpacked" && cp -a "${outAsar}.unpacked" "${OFFICIAL_ASAR}.unpacked" && chown -R root:root "${OFFICIAL_ASAR}.unpacked"`);
+        execFileSync('sudo', ['sh', '-c', cmds.join(' && ')], { stdio: 'inherit' });
+        ok(`Patched in place, backup: ${backup}`);
+    } else {
+        targetDir = PORTABLE_DIR;
+        inf('Copying official Claude to portable dir (this may take a moment)...');
+        fs.rmSync(PORTABLE_DIR, { recursive: true, force: true });
+        sh(`cp -a "${OFFICIAL_DIR}" "${PORTABLE_DIR}"`);
+        const dst = path.join(PORTABLE_DIR, 'resources', 'app.asar');
+        fs.copyFileSync(outAsar, dst);
+        fs.rmSync(dst + '.unpacked', { recursive: true, force: true });
+        sh(`cp -a "${outAsar}.unpacked" "${dst}.unpacked"`);
+        writeLauncher();
+        ok(`Portable build: ${PORTABLE_DIR}`);
+    }
     fs.rmSync(outAsar, { force: true });
     fs.rmSync(outAsar + '.unpacked', { recursive: true, force: true });
-    const dirs = unpackedDirs(srcAsar.endsWith('.orig') ? OFFICIAL_ASAR : srcAsar);
-    const unpackDir = dirs.length > 1 ? `{${dirs.join(',')}}` : dirs[0];
-    inf('Repacking app.asar...');
-    return asar().createPackageWithOptions(TMP, outAsar, unpackDir ? { unpackDir } : {}).then(() => {
-        fs.rmSync(TMP, { recursive: true, force: true });
-
-        let targetDir;
-        if (inPlace) {
-            targetDir = OFFICIAL_DIR;
-            inf('Installing in place (sudo)...');
-            const cmds = [];
-            if (!fs.existsSync(backup)) cmds.push(`cp -a "${OFFICIAL_ASAR}" "${backup}"`);
-            cmds.push(`install -m 644 "${outAsar}" "${OFFICIAL_ASAR}"`);
-            cmds.push(`rm -rf "${OFFICIAL_ASAR}.unpacked" && cp -a "${outAsar}.unpacked" "${OFFICIAL_ASAR}.unpacked" && chown -R root:root "${OFFICIAL_ASAR}.unpacked"`);
-            execFileSync('sudo', ['sh', '-c', cmds.join(' && ')], { stdio: 'inherit' });
-            ok(`Patched in place, backup: ${backup}`);
-        } else {
-            targetDir = PORTABLE_DIR;
-            inf('Copying official Claude to portable dir (this may take a moment)...');
-            fs.rmSync(PORTABLE_DIR, { recursive: true, force: true });
-            sh(`cp -a "${OFFICIAL_DIR}" "${PORTABLE_DIR}"`);
-            const dst = path.join(PORTABLE_DIR, 'resources', 'app.asar');
-            fs.copyFileSync(outAsar, dst);
-            fs.rmSync(dst + '.unpacked', { recursive: true, force: true });
-            sh(`cp -a "${outAsar}.unpacked" "${dst}.unpacked"`);
-            writeLauncher();
-            ok(`Portable build: ${PORTABLE_DIR}`);
-        }
-        fs.rmSync(outAsar, { force: true });
-        fs.rmSync(outAsar + '.unpacked', { recursive: true, force: true });
-
-        // 验证
-        const live = path.join(targetDir, 'resources', 'app.asar');
-        const check = patches.find(p => p.required) || patches[0];
-        if (check && check.find && !check.append) {
-            const vdir = path.join(HERE, '_verify_tmp');
-            fs.rmSync(vdir, { recursive: true, force: true });
-            asar().extractAll(live, vdir);
-            const build = path.join(vdir, '.vite', 'build');
-            const still = fs.readdirSync(build).filter(f => f.endsWith('.js')).some(f => {
-                const c = fs.readFileSync(path.join(build, f), 'utf-8');
-                return check.find instanceof RegExp ? new RegExp(check.find.source).test(c) : c.includes(check.find);
-            });
-            fs.rmSync(vdir, { recursive: true, force: true });
-            if (still) { err('Verification failed: original code still present'); return false; }
-            ok('Verified');
-        }
-        return true;
-    });
+    return true;
 }
 
 function writeLauncher() {
@@ -581,6 +591,8 @@ function help() {
                             方案 2：打补丁允许任意 HTTP 端点（默认生成 claude-portable/ 便携副本，--in-place 用 sudo 原地替换）
   node setup.js full-patch  [--in-place] [--all-flags]
                             方案 3（实验性）：官方登录模式下解锁开发特性、注入 CLI env、F12 DevTools
+  node setup.js patch-asar  --scheme http|full --in <app.asar> --out <app.asar> [--all-flags]
+                            只对指定 app.asar 打补丁并输出到 --out（含 .unpacked），供打包脚本 / PKGBUILD 调用
   node setup.js status      查看状态
   node setup.js launch      启动（优先便携副本）
   node setup.js uninstall   [--system] 移除配置、便携副本、原地补丁
@@ -595,6 +607,19 @@ async function main() {
 
     switch (cmd) {
         case 'status': return showStatus();
+        case 'patch-asar': {
+            const scheme = argVal('--scheme'), src = argVal('--in'), out = argVal('--out');
+            if (!scheme || !src || !out) { err('--scheme, --in and --out are required'); process.exit(2); }
+            if (!fs.existsSync(src)) { err(`Not found: ${src}`); process.exit(2); }
+            const patches = scheme === 'http' ? HTTP_PATCHES
+                : scheme === 'full' ? fullPatches({ allFlags: flag('--all-flags') })
+                : null;
+            if (!patches) { err(`Unknown scheme: ${scheme} (http | full)`); process.exit(2); }
+            inf(`Scheme: ${scheme}, app v${readAppVersion(src)}`);
+            if (!await patchAsarFile(path.resolve(src), path.resolve(out), patches)) process.exit(1);
+            ok(`Written: ${out} (+ .unpacked)`);
+            return;
+        }
         case 'launch': return launch(fs.existsSync(LAUNCHER) && fs.existsSync(PORTABLE_DIR));
         case 'uninstall': {
             killDesktop();

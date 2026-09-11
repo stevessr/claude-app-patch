@@ -48,7 +48,12 @@ node setup.js full-patch                                    # 方案 3（实验�
 node setup.js status
 node setup.js launch
 node setup.js uninstall   [--system]
+node setup.js patch-asar  --scheme http|full --in app.asar --out patched.asar   # 只打补丁，供打包脚本用
 ```
+
+> Arch 用户可以直接装打好补丁的包：[arch_lib](https://github.com/stevessr/custom_lib_build) 仓库里的
+> `claude-desktop-http-patch`（方案 2）/ `claude-desktop-full-patch`（方案 3），它们用 `patch-asar` 从官方 .deb 构建，
+> 装好后用自带的 `claude-desktop-3p-config config --url ... --key ...` 写配置即可。
 
 通用参数：`--from-cli`、`--url`、`--key`、`--auth bearer|x-api-key`、`--models a,b`（逗号分隔；不填则由端点的 `/v1/models` 自动发现）、
 `--system`（写 `/etc/claude-desktop/managed-settings.json`）、`--in-place`（方案 2/3：用 sudo 原地替换 `app.asar`，不生成便携副本）。
