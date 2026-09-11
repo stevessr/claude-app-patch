@@ -79,6 +79,7 @@ node setup.js patch-asar  --scheme http|full --in app.asar --out patched.asar   
   重新打包 `app.asar` 并生成 `launch.sh`；以后用 `./launch.sh` 启动
 - `--in-place`：用 sudo 直接替换 `/usr/lib/claude-desktop/resources/app.asar`（原文件备份为 `app.asar.orig`），软件包升级后需重新执行
 - Linux 版 Electron 不校验 asar 完整性，无需翻转 fuse
+- 方案 2/3 都会把客户端默认重试次数提到 **15**：桌面端自带 SDK 的 `maxRetries` 2 → 15，并向 Claude Code 引擎会话注入 `CLAUDE_CODE_MAX_RETRIES=15`
 
 ### 方案 3 `full-patch` — 官方登录模式功能解锁（实验性）
 

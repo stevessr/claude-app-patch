@@ -260,6 +260,25 @@ const HTTP_PATCHES = [
     },
 ];
 
+// 方案 2/3 共用：把客户端默认重试次数提到 15
+//   - 桌面端自带的 Anthropic SDK 默认 maxRetries??2
+//   - Claude Code 引擎子进程读 CLAUDE_CODE_MAX_RETRIES（本地会话与 Cowork 会话的 sessionEnv 各一处）
+const RETRY_PATCHES = [
+    {
+        name: 'SDK default maxRetries 2 -> 15',
+        file: '*',
+        find: /maxRetries=([\w$]+)\.maxRetries\?\?2\b/g,
+        replace: (_m, v) => `maxRetries=${v}.maxRetries??15`,
+    },
+    {
+        name: 'Claude Code session env: CLAUDE_CODE_MAX_RETRIES=15',
+        file: '*',
+        find: 'DISABLE_MICROCOMPACT:"1",',
+        replace: 'DISABLE_MICROCOMPACT:"1",CLAUDE_CODE_MAX_RETRIES:"15",',
+    },
+];
+HTTP_PATCHES.push(...RETRY_PATCHES);
+
 // 方案 3（实验性）：登录模式下的功能解锁。锚点用正则写，尽量跨版本。
 function fullPatches({ allFlags }) {
     // 注入顺序：~/.claude/settings.json 的 env，再用桌面进程自身的 ANTHROPIC_* 运行时环境变量覆盖
@@ -305,6 +324,7 @@ function fullPatches({ allFlags }) {
             append: mainHook,
         },
     ];
+    patches.push(...RETRY_PATCHES);
     if (allFlags) {
         patches.push({
             // 原文: function Jx(e){if(Cyt.has(e))return!0;let t=jx[e];return Kx(e,t),t?.on??!1}
