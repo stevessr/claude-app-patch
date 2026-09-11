@@ -53,6 +53,7 @@ jobs:
           zip -r 3p-https-without-login-without-patch.zip 3p-https-without-login-without-patch/
           zip -r 3p-http-without-login-need-patch.zip 3p-http-without-login-need-patch/
           zip -r official-need-login-need-patch.zip official-need-login-need-patch/
+          zip -r claude-app-patch-linux.zip linux/ -x 'linux/node_modules/*' 'linux/claude-portable/*' 'linux/_*' 'linux/launch.sh' 'linux/package-lock.json'
 
       - name: Delete existing release if any
         if: steps.should_build.outputs.BUILD == 'true'
@@ -80,6 +81,7 @@ jobs:
             | `3p-https-without-login-without-patch.zip` | ⭐ 方案1：3P HTTPS（推荐，免登录，不改文件） |
             | `3p-http-without-login-need-patch.zip` | 方案2：3P HTTP（免登录） |
             | `official-need-login-need-patch.zip` | 方案3：官方版补丁（需登录，功能解锁） |
+            | `claude-app-patch-linux.zip` | 🐧 Linux 版（三种方案合一，`./setup.sh`） |
 
             ### 方案说明
 
@@ -94,6 +96,9 @@ jobs:
             **方案3 - 官方版补丁（需登录）**
             需要 Anthropic 账号登录。解锁隐藏功能（Code Tab、Operon、Computer Use 等）。
 
+            **🐧 Linux**
+            `cd linux && ./setup.sh`，配置写入 `~/.config/Claude-3p/configLibrary/`（或 `--system` 写 `/etc/claude-desktop/managed-settings.json`），详见 `linux/README.md`。
+
             ---
             SHA256: `${{ steps.check.outputs.SHA256 }}`
           files: |
@@ -101,6 +106,7 @@ jobs:
             3p-https-without-login-without-patch.zip
             3p-http-without-login-need-patch.zip
             official-need-login-need-patch.zip
+            claude-app-patch-linux.zip
 
       - name: Update version file
         if: steps.check.outputs.HAS_UPDATE == 'true'

@@ -1,6 +1,8 @@
 # Claude Desktop Patch
 
-让 Claude Desktop (Windows) 接入自定义 API 端点，免登录使用。
+让 Claude Desktop (Windows / Linux) 接入自定义 API 端点，免登录使用。
+
+> **Linux 用户**请看 [`linux/README.md`](linux/README.md)：`cd linux && ./setup.sh` 即可，三种方案一一对应。
 
 方案 1，2 图示：
 ![alt text](images/preview-3p.png)
@@ -20,6 +22,7 @@
 | `3p-https-without-login-without-patch.zip` | ⭐ **方案 1**：免登录，HTTPS 端点，不改文件（推荐） |
 | `3p-http-without-login-need-patch.zip` | 方案 2：免登录，支持 HTTP 端点 |
 | `official-need-login-need-patch.zip` | 方案 3：需登录，解锁隐藏功能 |
+| `claude-app-patch-linux.zip` | 🐧 **Linux 版**：三种方案合一（`setup.sh`） |
 
 > 每日自动检测 Claude Desktop 新版本并发布 Release。
 
@@ -129,7 +132,7 @@ node 3p-http-without-login-need-patch\setup.js --uninstall    # 卸载
 A: 方案 1 要求 HTTPS 端点（Claude 官方限制）。如果你的端点是 HTTP，请用方案 2。
 
 **Q: Claude 更新了怎么办？**
-A: 方案 1 不受影响。方案 2/3 重新双击 `setup.bat` 即可。
+A: 方案 1 不受影响。方案 2/3 重新双击 `setup.bat` 即可（Linux 重新执行对应命令）。
 
 **Q: 为什么方案 2/3 要生成便携版？**
 A: Claude 安装在系统保护目录（WindowsApps），无法直接修改，所以复制一份到本地再打补丁。

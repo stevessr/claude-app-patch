@@ -6,6 +6,12 @@ package-lock.json
 claude-portable/
 3p-http-without-login-need-patch/claude-portable/
 official-need-login-need-patch/claude-portable/
+linux/claude-portable/
+linux/launch.sh
+linux/_patch_tmp/
+linux/_verify_tmp/
+linux/_patched.asar
+linux/_patched.asar.unpacked/
 
 # 临时提取目录
 _temp_extract/

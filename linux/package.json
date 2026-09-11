@@ -1,0 +1,8 @@
+{
+  "name": "claude-app-patch-linux",
+  "private": true,
+  "description": "Claude Desktop (Linux) 3P config / HTTP patch / full patch",
+  "dependencies": {
+    "@electron/asar": "^4.2.0"
+  }
+}
