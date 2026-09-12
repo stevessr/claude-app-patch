@@ -202,7 +202,17 @@ function unpackedDirs(asarPath) {
 }
 
 // ============ 补丁引擎 ============
-// patch: { name, file: 文件名 | RegExp | '*'(所有 .vite/build/*.js), find: string | RegExp, replace, required? }
+// patch: { name, file: 文件名 | RegExp | '*'(所有 .vite/build/*.js), find: string | RegExp, replace, compatible?, resultId?, required? }
+// compatible：新版本若已满足补丁目标，可用验证表达式计为已处理，无需强行改写无关代码。
+function patternMatches(pattern, code) {
+    if (!pattern) return false;
+    if (pattern instanceof RegExp) {
+        const flags = pattern.flags.replace('g', '').replace('y', '');
+        return new RegExp(pattern.source, flags).test(code);
+    }
+    return code.includes(pattern);
+}
+
 function applyPatches(extractDir, patches) {
     const buildDir = path.join(extractDir, '.vite', 'build');
     const jsFiles = fs.readdirSync(buildDir).filter(f => f.endsWith('.js'));
@@ -216,10 +226,12 @@ function applyPatches(extractDir, patches) {
             : p.file instanceof RegExp ? jsFiles.filter(f => p.file.test(f))
             : [p.file];
         let hits = 0;
+        let compatibleHits = 0;
         for (const f of targets) {
             if (!fs.existsSync(path.join(buildDir, f))) continue;
             let code = read(f);
             let next;
+            let fileHits = 0;
             if (p.find instanceof RegExp) {
                 const re = new RegExp(p.find.source, p.find.flags.includes('g') ? p.find.flags : p.find.flags + 'g');
                 let n = 0;
@@ -232,13 +244,18 @@ function applyPatches(extractDir, patches) {
                     n++;
                     return typeof p.replace === 'function' ? p.replace(...m) : m[0].replace(p.find, p.replace);
                 });
-                if (n) hits += n;
+                fileHits = n;
             } else if (code.includes(p.find)) {
                 const n = code.split(p.find).length - 1;
                 next = code.split(p.find).join(p.replace);
-                hits += n;
+                fileHits = n;
             }
             if (next !== undefined && next !== code) { cache.set(f, next); dirty.add(f); }
+            if (fileHits === 0 && p.compatible && patternMatches(p.compatible, code)) {
+                fileHits = 1;
+                compatibleHits++;
+            }
+            hits += fileHits;
         }
         if (p.append) {
             const f = p.file;
@@ -246,9 +263,18 @@ function applyPatches(extractDir, patches) {
             dirty.add(f);
             hits = 1;
         }
-        if (hits) { ok(`${p.name} (${hits})`); applied++; }
-        else if (p.required) { err(`MISS: ${p.name}`); missedRequired = true; }
-        else wrn(`MISS: ${p.name}`);
+        if (hits) {
+            const alreadyCompatible = compatibleHits > 0 && compatibleHits === hits;
+            const suffix = alreadyCompatible ? ', already compatible' : '';
+            p._lastResult = alreadyCompatible ? 'already-compatible' : 'patched';
+            ok(`${p.name} (${hits}${suffix})`);
+            if (p.resultId) console.log(`PATCH_RESULT ${p.resultId} state=${p._lastResult} hits=${hits}`);
+            applied++;
+        } else {
+            p._lastResult = null;
+            if (p.required) { err(`MISS: ${p.name}`); missedRequired = true; }
+            else wrn(`MISS: ${p.name}`);
+        }
     }
     for (const f of dirty) fs.writeFileSync(path.join(buildDir, f), cache.get(f), 'utf-8');
     inf(`Patches: ${applied}/${patches.length} applied`);
@@ -264,8 +290,12 @@ const HTTP_PATCHES = [
     {
         name: 'Allow HTTP endpoints (remove loopback-only restriction)',
         file: '*',
-        find: /n==="http:"&&\(!!e\.allowHttp\|\|!!e\.allowLoopbackHttp&&[\w$]+\.has\(r\)\)/g,
-        replace: () => 'n==="http:"',
+        find: /([\w$]+)==="http:"&&\(!!([\w$]+)\.allowHttp\|\|!!\2\.allowLoopbackHttp&&[\w$]+\.has\(([\w$]+)\)\)/g,
+        replace: (_m, protocol) => `${protocol}==="http:"`,
+        // Claude Desktop 1.52386.3 已在该 helper 中接受显式 http:// URL；
+        // 只有不带协议的地址规范化仍受 allowHttp 控制。
+        compatible: /n==="https:"\?!e\.rejectLoopback\|\|![\w$]+\([\w$]+\):n==="http:"/,
+        resultId: 'http-endpoint',
         required: true,
     },
 ];
@@ -316,6 +346,7 @@ function fullPatches({ allFlags }) {
             file: '*',
             find: /function ([\w$]+)\(e\)\{return [\w$]+\.app\.isPackaged\?\{status:"unavailable"\}:e\(\)\}/g,
             replace: (_m, fn) => `function ${fn}(e){return e()}`,
+            required: true,
         },
         {
             name: 'Default sidebarMode -> "code"',
@@ -377,19 +408,37 @@ async function patchAsarFile(srcAsar, outAsar, patches, { unpackedRef } = {}) {
     await asar().createPackageWithOptions(TMP, outAsar, unpackDir ? { unpackDir } : {});
     fs.rmSync(TMP, { recursive: true, force: true });
 
-    // 核验：必需补丁的原文不应再出现
-    const check = patches.find(p => p.required) || patches.find(p => p.find);
-    if (check && check.find) {
+    // 核验：每个必需补丁都必须在 applyPatches 中成功，且替换后的原文不能再出现。
+    const requiredPatches = patches.filter(p => p.required);
+    if (requiredPatches.length) {
         const vdir = path.join(HERE, '_verify_tmp');
         fs.rmSync(vdir, { recursive: true, force: true });
-        asar().extractAll(outAsar, vdir);
-        const build = path.join(vdir, '.vite', 'build');
-        const still = fs.readdirSync(build).filter(f => f.endsWith('.js')).some(f => {
-            const c = fs.readFileSync(path.join(build, f), 'utf-8');
-            return check.find instanceof RegExp ? new RegExp(check.find.source).test(c) : c.includes(check.find);
-        });
-        fs.rmSync(vdir, { recursive: true, force: true });
-        if (still) { err('Verification failed: original code still present'); return false; }
+        try {
+            asar().extractAll(outAsar, vdir);
+            const build = path.join(vdir, '.vite', 'build');
+            const files = fs.readdirSync(build).filter(f => f.endsWith('.js'));
+            for (const check of requiredPatches) {
+                if (!check._lastResult) {
+                    err(`Verification failed: required patch was not applied: ${check.name}`);
+                    return false;
+                }
+                const still = check.find && files.some(f => {
+                    const c = fs.readFileSync(path.join(build, f), 'utf-8');
+                    return patternMatches(check.find, c);
+                });
+                if (still) {
+                    err(`Verification failed: original code still present: ${check.name}`);
+                    return false;
+                }
+                if (check._lastResult === 'already-compatible' && check.compatible &&
+                    !files.some(f => patternMatches(check.compatible, fs.readFileSync(path.join(build, f), 'utf-8')))) {
+                    err(`Verification failed: compatibility signature missing: ${check.name}`);
+                    return false;
+                }
+            }
+        } finally {
+            fs.rmSync(vdir, { recursive: true, force: true });
+        }
         ok('Verified');
     }
     return true;
@@ -771,6 +820,7 @@ async function main() {
             if (lang) patches = [...patches, ...zh.asarPatches(lang)];
             inf(`Scheme: ${scheme}${lang ? ' + ' + lang : ''}, app v${readAppVersion(src)}`);
             if (!await patchAsarFile(path.resolve(src), path.resolve(out), patches)) process.exit(1);
+            if (scheme === 'http') inf('HTTP patch does not unlock full-patch features whose status is unavailable.');
             ok(`Written: ${out} (+ .unpacked)`);
             return;
         }
