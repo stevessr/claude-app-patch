@@ -11,7 +11,7 @@
 配置是扁平键名的 JSON（`inferenceProvider` / `inferenceGatewayBaseUrl` / `inferenceGatewayApiKey` / `inferenceModels` …），
 完整键名见 [官方文档](https://claude.com/docs/third-party/claude-desktop/configuration)。
 
-> 在 **1.49585.0** (Electron 44) 上实测通过；补丁锚点用正则编写，尽量兼容后续版本。
+> 在 **1.52386.3** (Electron 44) 上实测通过；补丁锚点用正则编写，尽量兼容后续版本。1.52386.3 已原生接受显式 `http://` URL，因此 HTTP 目标在该版本可能显示 `already compatible`，不需要强行修改字节；其它方案 2 共用补丁仍会按实际命中情况处理。
 
 ---
 
@@ -74,7 +74,7 @@ node setup.js patch-asar  --scheme http|full --in app.asar --out patched.asar   
 ### 方案 2 `http-patch` — 允许任意 HTTP 端点
 
 - **适用**：非 loopback 的 HTTP 端点（如局域网 `http://192.168.1.10:8317`）
-- 未打补丁时应用会报 `must use https (or http on loopback)` 并进入降级模式；补丁去掉这一限制
+- 旧版未打补丁时应用会报 `must use https (or http on loopback)` 并进入降级模式；补丁去掉这一限制。新版若已原生允许显式远程 `http://`，HTTP 目标会输出 `PATCH_RESULT http-endpoint state=already-compatible` 并只做验证，其它方案 2 共用补丁仍按命中情况处理
 - 默认把官方安装目录复制到 `linux/claude-portable/`（大多数文件系统上 `cp -a` 会用 reflink，几乎不占空间），
   重新打包 `app.asar` 并生成 `launch.sh`；以后用 `./launch.sh` 启动
 - `--in-place`：用 sudo 直接替换 `/usr/lib/claude-desktop/resources/app.asar`（原文件备份为 `app.asar.orig`），软件包升级后需重新执行
@@ -106,9 +106,9 @@ Windows 版那套补丁大部分已无对应锚点。本版移植了以下几项
 A: 副本里的 `chrome-sandbox` 不再是 root 所有的 setuid 文件。`launch.sh` 会在内核禁止非特权 user namespace 时自动加 `--no-sandbox`；
 也可以 `CLAUDE_NO_SANDBOX=1 ./launch.sh` 强制。
 
-**Q: 配置写了但还是要求登录？**
-A: `node setup.js status` 看看 `/etc/claude-desktop/managed-settings.json` 是否存在（它优先级更高），再看 `~/.config/Claude-3p/logs/main.log`
-里 `[custom-3p]` 开头的行；`Failed to parse managed config` 会说明哪个键不合法。
+**Q: 配置写了但还是要求登录或显示 App unavailable？**
+A: `http-patch` 只处理远程 `http://` endpoint 的 URL 校验，不会解除 full patch 的 `isPackaged` 功能门控；`status:"unavailable"` 也可能只是某个当前平台不可用的独立 feature。先运行 `node setup.js status`，再检查 `~/.config/Claude-3p/logs/main.log`：
+`Failed to parse managed config` 或 `3P mode active (degraded)` 表示 endpoint 配置无效，`[custom-3p] inference apiHost=...` 表示实际使用的地址。若要解除 full 功能门控，请改用 `full-patch`；若只是合法的远程 HTTP endpoint，确保使用 `claude-desktop-3p-config config --url http://... --key ...` 写入配置。
 
 **Q: Claude 更新了怎么办？**
 A: 方案 1 不受影响。方案 2/3 重新执行一次对应命令即可（原地模式会自动从 `app.asar.orig` 重新打补丁；若软件包升级覆盖了 asar，则以新文件为准）。
