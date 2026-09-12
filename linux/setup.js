@@ -44,6 +44,8 @@ const LOCAL_META = path.join(LOCAL_CONFIG_DIR, '_meta.json');
 const SYSTEM_DIR = '/etc/claude-desktop';
 const SYSTEM_FILE = path.join(SYSTEM_DIR, 'managed-settings.json');
 const ENTRY_NAME = 'claude-app-patch';
+const ZH_CACHE = path.join(HERE, '_zh-cn');
+const zh = require('./zh');
 
 const args = process.argv.slice(2);
 const cmd = args[0] && !args[0].startsWith('-') ? args.shift() : null;
@@ -221,7 +223,15 @@ function applyPatches(extractDir, patches) {
             if (p.find instanceof RegExp) {
                 const re = new RegExp(p.find.source, p.find.flags.includes('g') ? p.find.flags : p.find.flags + 'g');
                 let n = 0;
-                next = code.replace(re, (...m) => { n++; return typeof p.replace === 'function' ? p.replace(...m) : m[0].replace(p.find, p.replace); });
+                next = code.replace(re, (...m) => {
+                    // p.near：匹配点前后 3000 字符内必须出现该字符串，避免同形代码误中
+                    if (p.near) {
+                        const off = m[m.length - 2];
+                        if (!code.slice(Math.max(0, off - 3000), off + 3000).includes(p.near)) return m[0];
+                    }
+                    n++;
+                    return typeof p.replace === 'function' ? p.replace(...m) : m[0].replace(p.find, p.replace);
+                });
                 if (n) hits += n;
             } else if (code.includes(p.find)) {
                 const n = code.split(p.find).length - 1;
@@ -260,10 +270,13 @@ const HTTP_PATCHES = [
     },
 ];
 
-// 方案 2/3 共用：把客户端默认重试次数提到 15
-//   - 桌面端自带的 Anthropic SDK 默认 maxRetries??2
-//   - Claude Code 引擎子进程读 CLAUDE_CODE_MAX_RETRIES（本地会话与 Cowork 会话的 sessionEnv 各一处）
-const RETRY_PATCHES = [
+// 方案 2/3 共用：
+//   - 客户端默认重试次数提到 15：桌面端自带的 Anthropic SDK 默认 maxRetries??2；
+//     Claude Code 引擎子进程读 CLAUDE_CODE_MAX_RETRIES（本地会话与 Cowork 会话的 sessionEnv 各一处）
+//   - 放开 3P 模型名校验：原版只接受含 claude/sonnet/opus/haiku/fable/mythos/anthropic 的模型名，
+//     deepseek/qwen/gpt 等会被从 inferenceModels 里剔除（思路来自 claude-desktop-zh-cn 的 patch_custom3p_model_validation）
+//     原文: function Ya(e){let t=e.toLowerCase();return B_e.test(t)?!1:R_e.test(t)||z_e.some((e=>t.includes(e)))}
+const COMMON_PATCHES = [
     {
         name: 'SDK default maxRetries 2 -> 15',
         file: '*',
@@ -276,8 +289,15 @@ const RETRY_PATCHES = [
         find: 'DISABLE_MICROCOMPACT:"1",',
         replace: 'DISABLE_MICROCOMPACT:"1",CLAUDE_CODE_MAX_RETRIES:"15",',
     },
+    {
+        name: 'Accept any model name for 3P providers (skip Anthropic-name check)',
+        file: '*',
+        find: /function ([\w$]+)\(e\)\{let t=e\.toLowerCase\(\);return [\w$]+\.test\(t\)\?!1:[\w$]+\.test\(t\)\|\|[\w$]+\.some\(\(e=>t\.includes\(e\)\)\)\}/g,
+        near: 'expected a gateway model route referencing an Anthropic model',
+        replace: (_m, fn) => `function ${fn}(e){return!0}`,
+    },
 ];
-HTTP_PATCHES.push(...RETRY_PATCHES);
+HTTP_PATCHES.push(...COMMON_PATCHES);
 
 // 方案 3（实验性）：登录模式下的功能解锁。锚点用正则写，尽量跨版本。
 function fullPatches({ allFlags }) {
@@ -324,7 +344,7 @@ function fullPatches({ allFlags }) {
             append: mainHook,
         },
     ];
-    patches.push(...RETRY_PATCHES);
+    patches.push(...COMMON_PATCHES);
     if (allFlags) {
         patches.push({
             // 原文: function Jx(e){if(Cyt.has(e))return!0;let t=jx[e];return Kx(e,t),t?.on??!1}
@@ -375,10 +395,74 @@ async function patchAsarFile(srcAsar, outAsar, patches, { unpackedRef } = {}) {
     return true;
 }
 
+// ============ 中文界面资源 ============
+// 中文资源改的是 resources/ 下的文件（ion-dist 前端、i18n、桌面壳层翻译），不在 app.asar 里。
+// 原地模式下先备份 resources/ion-dist 为 ion-dist.orig，卸载时还原。
+async function zhPack(lang) {
+    return zh.resolveResources({ lang, dir: argVal('--zh-dir'), ref: argVal('--zh-ref'), cacheDir: ZH_CACHE, log: inf });
+}
+
+async function applyZhResources(resDir, lang, { inPlace }) {
+    const packDir = await zhPack(lang);
+    if (!inPlace) {
+        zh.applyResources(resDir, lang, packDir, inf);
+        ok(`Chinese UI (${lang}) resources installed: ${resDir}`);
+        return;
+    }
+    // 原地：在临时副本上打，再用 sudo 换回去
+    const tmp = path.join(HERE, '_zh_tmp');
+    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.mkdirSync(tmp, { recursive: true });
+    const orig = path.join(resDir, 'ion-dist.orig');
+    const srcIon = fs.existsSync(orig) ? orig : path.join(resDir, 'ion-dist');
+    inf('Copying resources to a temp dir for in-place Chinese patch...');
+    sh(`cp -a "${srcIon}" "${tmp}/ion-dist" && cp -a "${resDir}/en-US.json" "${tmp}/en-US.json"`);
+    zh.applyResources(tmp, lang, packDir, inf);
+    inf('Installing Chinese resources in place (sudo)...');
+    const cmds = [];
+    if (!fs.existsSync(orig)) cmds.push(`cp -a "${resDir}/ion-dist" "${orig}"`);
+    cmds.push(`rm -rf "${resDir}/ion-dist" && cp -a "${tmp}/ion-dist" "${resDir}/ion-dist"`);
+    cmds.push(`install -m 644 "${tmp}/${lang}.json" "${resDir}/${lang}.json"`);
+    cmds.push(`rm -rf "${resDir}/${zh.RUNTIME_DIR}" && cp -a "${tmp}/${zh.RUNTIME_DIR}" "${resDir}/${zh.RUNTIME_DIR}"`);
+    cmds.push(`chown -R root:root "${resDir}/ion-dist" "${resDir}/${zh.RUNTIME_DIR}" "${resDir}/${lang}.json"`);
+    execFileSync('sudo', ['sh', '-c', cmds.join(' && ')], { stdio: 'inherit' });
+    fs.rmSync(tmp, { recursive: true, force: true });
+    ok(`Chinese UI (${lang}) installed in place, backup: ${orig}`);
+}
+
+function removeZhInPlace(resDir) {
+    const orig = path.join(resDir, 'ion-dist.orig');
+    const runtime = path.join(resDir, zh.RUNTIME_DIR);
+    if (!fs.existsSync(orig) && !fs.existsSync(runtime)) return;
+    inf('Restoring original resources (sudo)...');
+    const cmds = [];
+    if (fs.existsSync(orig)) cmds.push(`rm -rf "${resDir}/ion-dist" && mv "${orig}" "${resDir}/ion-dist"`);
+    for (const l of zh.LANGS) if (fs.existsSync(path.join(resDir, `${l}.json`))) cmds.push(`rm -f "${resDir}/${l}.json"`);
+    cmds.push(`rm -rf "${runtime}"`);
+    execFileSync('sudo', ['sh', '-c', cmds.join(' && ')], { stdio: 'inherit' });
+    ok('Chinese UI resources removed');
+}
+
+// ============ 用户语言设置 ============
+// 主进程从 <userData>/config.json 的 locale 读取界面语言；官方模式与 3P 模式的 userData 不同，两处都写
+function setUserLocale(lang) {
+    const targets = [path.join(XDG_CONFIG, 'Claude', 'config.json'), path.join(XDG_CONFIG, 'Claude-3p', 'config.json')];
+    for (const f of targets) {
+        if (!fs.existsSync(path.dirname(f))) { if (f.includes('Claude-3p')) continue; fs.mkdirSync(path.dirname(f), { recursive: true }); }
+        let data = {};
+        try { data = JSON.parse(fs.readFileSync(f, 'utf-8')); if (!data || typeof data !== 'object') data = {}; } catch {}
+        if (data.locale === lang) { inf(`locale already ${lang}: ${f}`); continue; }
+        data.locale = lang;
+        fs.writeFileSync(f, JSON.stringify(data, null, '\t') + '\n', { mode: 0o600 });
+        ok(`locale = ${lang}: ${f}`);
+    }
+}
+
 // ============ 构建：便携副本 或 原地替换 ============
-async function buildPatched(patches, { inPlace }) {
+async function buildPatched(patches, { inPlace, lang }) {
     if (!OFFICIAL_DIR || !OFFICIAL_BIN) { err('Official Claude Desktop not found (looked for resources/app.asar next to the binary)'); return false; }
     inf(`Official: ${OFFICIAL_DIR} (v${readAppVersion(OFFICIAL_ASAR)})`);
+    if (lang) patches = [...patches, ...zh.asarPatches(lang)];
 
     // 原始 asar：原地模式下优先用备份，保证可重复打补丁
     let srcAsar = OFFICIAL_ASAR;
@@ -412,6 +496,11 @@ async function buildPatched(patches, { inPlace }) {
     }
     fs.rmSync(outAsar, { force: true });
     fs.rmSync(outAsar + '.unpacked', { recursive: true, force: true });
+
+    if (lang) {
+        await applyZhResources(path.join(targetDir, 'resources'), lang, { inPlace });
+        setUserLocale(lang);
+    }
     return true;
 }
 
@@ -644,15 +733,20 @@ function help() {
                             --from-cli 读取顺序：运行时环境变量 > ~/.claude/settings.json 的 env
                               ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN (Bearer) / ANTHROPIC_API_KEY (x-api-key)
                               ANTHROPIC_MODEL, ANTHROPIC_DEFAULT_{FABLE,OPUS,SONNET,HAIKU}_MODEL[_NAME] → 模型列表
-  node setup.js http-patch  [同上] [--in-place]
+  node setup.js http-patch  [同上] [--in-place] [--lang zh-CN|zh-TW|zh-HK]
                             方案 2：打补丁允许任意 HTTP 端点（默认生成 claude-portable/ 便携副本，--in-place 用 sudo 原地替换）
-  node setup.js full-patch  [--in-place] [--all-flags]
+  node setup.js full-patch  [--in-place] [--all-flags] [--lang ...]
                             方案 3（实验性）：官方登录模式下解锁开发特性、注入 CLI env、F12 DevTools
-  node setup.js patch-asar  --scheme http|full --in <app.asar> --out <app.asar> [--all-flags]
+  node setup.js patch-asar  --scheme http|full --in <app.asar> --out <app.asar> [--all-flags] [--lang ...]
                             只对指定 app.asar 打补丁并输出到 --out（含 .unpacked），供打包脚本 / PKGBUILD 调用
+  node setup.js zh-resources --lang zh-CN --resources <resources 目录> [--zh-dir <上游仓库目录> | --zh-ref <tag>]
+                            只安装中文界面资源到指定的 resources/ 目录（就地修改），供打包脚本 / PKGBUILD 调用
+  node setup.js locale <zh-CN|en-US|...>   设置界面语言（写 ~/.config/Claude 与 Claude-3p 的 config.json）
   node setup.js status      查看状态
   node setup.js launch      启动（优先便携副本）
   node setup.js uninstall   [--system] 移除配置、便携副本、原地补丁
+
+  --lang：集成 javaht/claude-desktop-zh-cn 的中文界面补丁（翻译资源首次使用时下载，--zh-dir 可指定本地上游仓库）
 `);
 }
 
@@ -661,6 +755,8 @@ async function main() {
     const interactive = !flag('--from-cli') && !argVal('--url') && process.stdin.isTTY;
     const system = flag('--system');
     const inPlace = flag('--in-place');
+    const lang = argVal('--lang');
+    if (lang && !zh.LANGS.includes(lang)) { err(`--lang must be one of ${zh.LANGS.join(' | ')}`); process.exit(2); }
 
     switch (cmd) {
         case 'status': return showStatus();
@@ -668,13 +764,29 @@ async function main() {
             const scheme = argVal('--scheme'), src = argVal('--in'), out = argVal('--out');
             if (!scheme || !src || !out) { err('--scheme, --in and --out are required'); process.exit(2); }
             if (!fs.existsSync(src)) { err(`Not found: ${src}`); process.exit(2); }
-            const patches = scheme === 'http' ? HTTP_PATCHES
+            let patches = scheme === 'http' ? HTTP_PATCHES
                 : scheme === 'full' ? fullPatches({ allFlags: flag('--all-flags') })
                 : null;
             if (!patches) { err(`Unknown scheme: ${scheme} (http | full)`); process.exit(2); }
-            inf(`Scheme: ${scheme}, app v${readAppVersion(src)}`);
+            if (lang) patches = [...patches, ...zh.asarPatches(lang)];
+            inf(`Scheme: ${scheme}${lang ? ' + ' + lang : ''}, app v${readAppVersion(src)}`);
             if (!await patchAsarFile(path.resolve(src), path.resolve(out), patches)) process.exit(1);
             ok(`Written: ${out} (+ .unpacked)`);
+            return;
+        }
+        case 'zh-resources': {
+            const resDir = argVal('--resources');
+            if (!lang || !resDir) { err('--lang and --resources are required'); process.exit(2); }
+            const packDir = await zhPack(lang);
+            zh.applyResources(path.resolve(resDir), lang, packDir, inf);
+            ok(`Chinese UI (${lang}) resources installed: ${resDir}`);
+            return;
+        }
+        case 'locale': {
+            const l = args[0];
+            if (!l || !/^[a-z]{2,3}-[A-Za-z0-9]{2,8}$/.test(l)) { err('usage: locale <zh-CN|en-US|...>'); process.exit(2); }
+            killDesktop();
+            setUserLocale(l);
             return;
         }
         case 'launch': return launch(fs.existsSync(LAUNCHER) && fs.existsSync(PORTABLE_DIR));
@@ -689,6 +801,7 @@ async function main() {
                 wrn('app.asar.unpacked was rebuilt from the same files; reinstall the package if anything looks off');
                 ok('In-place patch reverted');
             }
+            if (OFFICIAL_DIR) removeZhInPlace(path.join(OFFICIAL_DIR, 'resources'));
             ok('Uninstall complete');
             return;
         }
@@ -709,7 +822,7 @@ async function main() {
             if (!ep) process.exit(1);
             if (!ep.url.startsWith('http://') || isLoopbackUrl(ep.url)) inf('This endpoint would also work without patching (方案 1); patching anyway for consistency');
             killDesktop();
-            if (!await buildPatched(HTTP_PATCHES, { inPlace })) { err('Patch failed'); process.exit(1); }
+            if (!await buildPatched(HTTP_PATCHES, { inPlace, lang })) { err('Patch failed'); process.exit(1); }
             writeConfig(ep, system);
             launch(!inPlace);
             console.log(`\n${C.g}  Done!${C.r} ${inPlace ? '' : `${C.c}Next time: ./launch.sh${C.r}`}\n`);
@@ -722,7 +835,7 @@ async function main() {
             else wrn('No ANTHROPIC_* env (runtime or ~/.claude/settings.json) found; Claude Code sessions will use the official endpoint');
             if (fs.existsSync(SYSTEM_FILE) || (readMeta() || {}).appliedId) wrn('A 3P config is present; remove it (uninstall) if you want the official login mode');
             killDesktop();
-            if (!await buildPatched(fullPatches({ allFlags: flag('--all-flags') }), { inPlace })) { err('Patch failed'); process.exit(1); }
+            if (!await buildPatched(fullPatches({ allFlags: flag('--all-flags') }), { inPlace, lang })) { err('Patch failed'); process.exit(1); }
             // 只写应用行为类键（遥测/更新），不会触发 3P 模式
             writeConfig({ telemetryOnly: true }, system);
             launch(!inPlace);
