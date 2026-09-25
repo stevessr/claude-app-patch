@@ -11,7 +11,7 @@
 配置是扁平键名的 JSON（`inferenceProvider` / `inferenceGatewayBaseUrl` / `inferenceGatewayApiKey` / `inferenceModels` …），
 完整键名见 [官方文档](https://claude.com/docs/third-party/claude-desktop/configuration)。
 
-> 在 **1.52386.3** (Electron 44) 上实测通过；补丁锚点用正则编写，尽量兼容后续版本。1.52386.3 已原生接受显式 `http://` URL，因此 HTTP 目标在该版本可能显示 `already compatible`，不需要强行修改字节；其它方案 2 共用补丁仍会按实际命中情况处理。
+> 在 **1.52386.3** (Electron 44) / **2.7032.0** 上实测通过；补丁锚点用正则编写，尽量兼容后续版本。1.52386.3 已原生接受显式 `http://` URL，因此 HTTP 目标在该版本可能显示 `already compatible`，不需要强行修改字节；其它方案 2 共用补丁仍会按实际命中情况处理。
 
 ---
 
@@ -80,6 +80,8 @@ node setup.js patch-asar  --scheme http|full --in app.asar --out patched.asar   
 - `--in-place`：用 sudo 直接替换 `/usr/lib/claude-desktop/resources/app.asar`（原文件备份为 `app.asar.orig`），软件包升级后需重新执行
 - Linux 版 Electron 不校验 asar 完整性，无需翻转 fuse
 - 方案 2/3 都会把客户端默认重试次数提到 **15**：桌面端自带 SDK 的 `maxRetries` 2 → 15，并向 Claude Code 引擎会话注入 `CLAUDE_CODE_MAX_RETRIES=15`
+- 方案 2/3 都会放开 3P 模型名校验：3P 校验在 `app.asar`（主进程）与 `resources/ion-dist`（渲染进程）各有一份独立代码，两处都打补丁，
+  `inferenceModels` 里可以放 `deepseek` / `gpt` / `glm` 等自定义名称，不再被剔除或在选择器/设置页报 “这似乎不是 Anthropic 模型”
 
 ### 方案 3 `full-patch` — 官方登录模式功能解锁（实验性）
 
@@ -109,6 +111,12 @@ A: 副本里的 `chrome-sandbox` 不再是 root 所有的 setuid 文件。`launc
 **Q: 配置写了但还是要求登录或显示 App unavailable？**
 A: `http-patch` 只处理远程 `http://` endpoint 的 URL 校验，不会解除 full patch 的 `isPackaged` 功能门控；`status:"unavailable"` 也可能只是某个当前平台不可用的独立 feature。先运行 `node setup.js status`，再检查 `~/.config/Claude-3p/logs/main.log`：
 `Failed to parse managed config` 或 `3P mode active (degraded)` 表示 endpoint 配置无效，`[custom-3p] inference apiHost=...` 表示实际使用的地址。若要解除 full 功能门控，请改用 `full-patch`；若只是合法的远程 HTTP endpoint，确保使用 `claude-desktop-3p-config config --url http://... --key ...` 写入配置。
+
+**Q: 选择器/设置页报 “这似乎不是 Anthropic 模型：expected a gateway model route…”？**
+A: 3P 模型名校验在 `app.asar`（主进程）与 `resources/ion-dist`（渲染进程）各有一份独立代码，两处都要打补丁；
+只补了 asar 那份时（旧版工具），主进程能接受自定义模型名，但界面仍会报这个错。重新执行一次
+`http-patch` / `full-patch`，或只补渲染进程：`node setup.js patch-models --resources <resources 目录>`。
+`--in-place` / root 目录下首次执行会备份 `ion-dist.orig`，卸载时还原。
 
 **Q: Claude 更新了怎么办？**
 A: 方案 1 不受影响。方案 2/3 重新执行一次对应命令即可（原地模式会自动从 `app.asar.orig` 重新打补丁；若软件包升级覆盖了 asar，则以新文件为准）。

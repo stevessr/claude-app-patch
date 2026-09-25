@@ -236,10 +236,12 @@ function applyPatches(extractDir, patches) {
                 const re = new RegExp(p.find.source, p.find.flags.includes('g') ? p.find.flags : p.find.flags + 'g');
                 let n = 0;
                 next = code.replace(re, (...m) => {
-                    // p.near：匹配点前后 3000 字符内必须出现该字符串，避免同形代码误中
+                    // p.near：匹配点前后 3000 字符内必须出现该字符串（或数组中任一），避免同形代码误中
                     if (p.near) {
                         const off = m[m.length - 2];
-                        if (!code.slice(Math.max(0, off - 3000), off + 3000).includes(p.near)) return m[0];
+                        const around = code.slice(Math.max(0, off - 3000), off + 3000);
+                        const nears = Array.isArray(p.near) ? p.near : [p.near];
+                        if (!nears.some(s => around.includes(s))) return m[0];
                     }
                     n++;
                     return typeof p.replace === 'function' ? p.replace(...m) : m[0].replace(p.find, p.replace);
@@ -306,6 +308,8 @@ const HTTP_PATCHES = [
 //   - 放开 3P 模型名校验：原版只接受含 claude/sonnet/opus/haiku/fable/mythos/anthropic 的模型名，
 //     deepseek/qwen/gpt 等会被从 inferenceModels 里剔除（思路来自 claude-desktop-zh-cn 的 patch_custom3p_model_validation）
 //     原文: function Ya(e){let t=e.toLowerCase();return B_e.test(t)?!1:R_e.test(t)||z_e.some((e=>t.includes(e)))}
+//     注意：同一段校验在 resources/ion-dist（渲染进程）还有一份独立代码，asar 补丁覆盖不到，
+//     须由 patchIonDistModels 在构建后对 ion-dist 单独打补丁，否则选择器/设置页仍会报“这似乎不是 Anthropic 模型”。
 const COMMON_PATCHES = [
     {
         name: 'SDK default maxRetries 2 -> 15',
@@ -322,8 +326,9 @@ const COMMON_PATCHES = [
     {
         name: 'Accept any model name for 3P providers (skip Anthropic-name check)',
         file: '*',
-        find: /function ([\w$]+)\(e\)\{let t=e\.toLowerCase\(\);return [\w$]+\.test\(t\)\?!1:[\w$]+\.test\(t\)\|\|[\w$]+\.some\(\(e=>t\.includes\(e\)\)\)\}/g,
-        near: 'expected a gateway model route referencing an Anthropic model',
+        // minify 形态可变：.some((e=>t.includes(e))) 与 .some(e=>t.includes(e)) 两种括号都接受
+        find: /function ([\w$]+)\(e\)\{let t=e\.toLowerCase\(\);return [\w$]+\.test\(t\)\?!1:[\w$]+\.test\(t\)\|\|[\w$]+\.some\(\(?[\w$]+=>t\.includes\([\w$]+\)\)?\)\}/g,
+        near: ['expected a gateway model route referencing an Anthropic model', '网关模型路由', '閘道模型路由'],
         replace: (_m, fn) => `function ${fn}(e){return!0}`,
     },
 ];
@@ -444,6 +449,96 @@ async function patchAsarFile(srcAsar, outAsar, patches, { unpackedRef } = {}) {
     return true;
 }
 
+// ============ 渲染进程（ion-dist）模型名校验补丁 ============
+// 3P 模型名校验在 app.asar（主进程）与 resources/ion-dist/assets（渲染进程）各有一份独立代码；
+// COMMON_PATCHES 只覆盖前者。渲染进程那份不打补丁时，选择器/设置页仍会报
+// “这似乎不是 Anthropic 模型：expected a gateway model route…” 并拒绝 deepseek/gpt/glm 等自定义名称。
+// ion-dist 在磁盘上（不在 asar 里），会随上游更新被覆盖，因此 buildPatched 每次构建后重新执行。
+// 原文（渲染进程，minify 与主进程不同，箭头函数括号形态可变）:
+//   function rr(e){let t=e.toLowerCase();return nr.test(t)?!1:er.test(t)||tr.some(e=>t.includes(e))}
+const ION_DIST_MODEL_NEAR = [
+    'expected a gateway model route referencing an Anthropic model',
+    '网关模型路由',  // zh-CN 译文特征片段
+    '閘道模型路由',  // zh-TW / zh-HK 译文
+];
+
+// 纯内存补丁：遍历 ion-dist/assets/**/*.js，返回 { changes:[{file,code}], hits, already }
+function patchIonDistCode(ionDir) {
+    const changes = [];
+    let hits = 0, already = 0;
+    const assetsDir = path.join(ionDir, 'assets');
+    if (!fs.existsSync(assetsDir)) return { changes, hits, already };
+    // minify 形态可变：.some((e=>t.includes(e))) 与 .some(e=>t.includes(e)) 两种括号都接受
+    const findRe = /function ([\w$]+)\(e\)\{let t=e\.toLowerCase\(\);return [\w$]+\.test\(t\)\?!1:[\w$]+\.test\(t\)\|\|[\w$]+\.some\(\(?[\w$]+=>t\.includes\([\w$]+\)\)?\)\}/g;
+    const patchedRe = /function [\w$]+\(e\)\{return!0\}/g;
+    // near：匹配点前后 3000 字符内须出现网关路由报错原文或其译文，避免同形代码误中
+    const nearHit = (code, off) => {
+        const around = code.slice(Math.max(0, off - 3000), off + 3000);
+        return ION_DIST_MODEL_NEAR.some(s => around.includes(s));
+    };
+    const walk = d => {
+        for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+            const p = path.join(d, e.name);
+            if (e.isDirectory()) { walk(p); continue; }
+            if (!e.name.endsWith('.js')) continue;
+            let code;
+            try { code = fs.readFileSync(p, 'utf-8'); } catch { continue; }
+            let n = 0;
+            const next = code.replace(findRe, (m, fn, off) => nearHit(code, off) ? (n++, `function ${fn}(e){return!0}`) : m);
+            if (n) { changes.push({ file: p, code: next }); hits += n; continue; }
+            // 重跑时识别已打过的补丁形态（补丁函数须出现在报错原文附近）
+            let mm;
+            const re = new RegExp(patchedRe.source, 'g');
+            while ((mm = re.exec(code))) { if (nearHit(code, mm.index)) { already++; break; } }
+        }
+    };
+    walk(assetsDir);
+    return { changes, hits, already };
+}
+
+// 对 resources/ 目录里的 ion-dist 打模型名补丁。直接可写（便携副本 / PKGBUILD srcdir）就原地写；
+// root 所有的官方目录（--in-place 或手动）先备份 ion-dist.orig，再逐文件经 sudo 换回。
+function patchIonDistModels(resDir, { resultId } = {}) {
+    const ionDir = path.join(resDir, 'ion-dist');
+    if (!fs.existsSync(ionDir)) { wrn(`ion-dist not found under ${resDir} — renderer model patch skipped`); return false; }
+    const { changes, hits, already } = patchIonDistCode(ionDir);
+    if (!changes.length) {
+        if (already) {
+            ok(`Renderer model-name patch: already compatible (${already} file(s))`);
+            if (resultId) console.log(`PATCH_RESULT ${resultId} state=already-compatible hits=${already}`);
+            return true;
+        }
+        wrn('MISS: renderer model-name check anchor not found — app version probably changed');
+        if (resultId) console.log(`PATCH_RESULT ${resultId} state=missed hits=0`);
+        return false;
+    }
+    let useSudo = false;
+    try { fs.accessSync(changes[0].file, fs.constants.W_OK); } catch { useSudo = true; }
+    if (!useSudo) {
+        for (const c of changes) fs.writeFileSync(c.file, c.code, 'utf-8');
+        ok(`Renderer model-name patch applied (${hits} hit(s) in ${changes.length} file(s))`);
+        if (resultId) console.log(`PATCH_RESULT ${resultId} state=patched hits=${hits}`);
+        return true;
+    }
+    const orig = path.join(resDir, 'ion-dist.orig');
+    const tmp = path.join(HERE, '_ion_patch_tmp');
+    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.mkdirSync(tmp, { recursive: true });
+    const cmds = [];
+    if (!fs.existsSync(orig)) cmds.push(`cp -a "${ionDir}" "${orig}"`);
+    for (const c of changes) {
+        const t = path.join(tmp, path.basename(c.file) + '.patched');
+        fs.writeFileSync(t, c.code, 'utf-8');
+        cmds.push(`install -m 644 -o root -g root "${t}" "${c.file}"`);
+    }
+    inf('Installing renderer model patch in place (sudo)...');
+    execFileSync('sudo', ['sh', '-c', cmds.join(' && ')], { stdio: 'inherit' });
+    fs.rmSync(tmp, { recursive: true, force: true });
+    ok(`Renderer model-name patch applied in place (${hits} hit(s)), backup: ${orig}`);
+    if (resultId) console.log(`PATCH_RESULT ${resultId} state=patched hits=${hits}`);
+    return true;
+}
+
 // ============ 中文界面资源 ============
 // 中文资源改的是 resources/ 下的文件（ion-dist 前端、i18n、桌面壳层翻译），不在 app.asar 里。
 // 原地模式下先备份 resources/ion-dist 为 ion-dist.orig，卸载时还原。
@@ -550,6 +645,8 @@ async function buildPatched(patches, { inPlace, lang }) {
         await applyZhResources(path.join(targetDir, 'resources'), lang, { inPlace });
         setUserLocale(lang);
     }
+    // 渲染进程（ion-dist）的模型名校验与 app.asar 里的是独立代码，asar 补丁覆盖不到，必须单独打
+    patchIonDistModels(path.join(targetDir, 'resources'), { resultId: 'renderer-models' });
     return true;
 }
 
@@ -702,6 +799,15 @@ function showStatus() {
     if (OFFICIAL_ASAR && fs.existsSync(OFFICIAL_ASAR + '.orig')) ok('In-place patch: applied (backup app.asar.orig present)');
     if (fs.existsSync(PORTABLE_DIR)) ok(`Portable: ${PORTABLE_DIR} (v${readAppVersion(path.join(PORTABLE_DIR, 'resources', 'app.asar'))})`);
     else inf('Portable: not built');
+    for (const [label, dir] of [['Official', OFFICIAL_DIR], ['Portable', PORTABLE_DIR]]) {
+        if (!dir) continue;
+        const ion = path.join(dir, 'resources', 'ion-dist');
+        if (!fs.existsSync(ion)) continue;
+        const { hits, already } = patchIonDistCode(ion);
+        if (hits) wrn(`${label} renderer model patch: NOT applied (model picker may reject non-Anthropic names)`);
+        else if (already) ok(`${label} renderer model patch: applied`);
+        else wrn(`${label} renderer: model-check anchor not found (app version changed?)`);
+    }
 
     hdr('===== 3P Config =====');
     if (fs.existsSync(SYSTEM_FILE)) {
@@ -790,6 +896,8 @@ function help() {
                             只对指定 app.asar 打补丁并输出到 --out（含 .unpacked），供打包脚本 / PKGBUILD 调用
   node setup.js zh-resources --lang zh-CN --resources <resources 目录> [--zh-dir <上游仓库目录> | --zh-ref <tag>]
                             只安装中文界面资源到指定的 resources/ 目录（就地修改），供打包脚本 / PKGBUILD 调用
+  node setup.js patch-models --resources <resources 目录>
+                            只对 ion-dist 渲染进程打 3P 模型名补丁（就地修改，root 目录走 sudo），供打包脚本 / PKGBUILD 调用
   node setup.js locale <zh-CN|en-US|...>   设置界面语言（写 ~/.config/Claude 与 Claude-3p 的 config.json）
   node setup.js status      查看状态
   node setup.js launch      启动（优先便携副本）
@@ -829,7 +937,16 @@ async function main() {
             if (!lang || !resDir) { err('--lang and --resources are required'); process.exit(2); }
             const packDir = await zhPack(lang);
             zh.applyResources(path.resolve(resDir), lang, packDir, inf);
+            patchIonDistModels(path.resolve(resDir), { resultId: 'renderer-models' });
             ok(`Chinese UI (${lang}) resources installed: ${resDir}`);
+            return;
+        }
+        case 'patch-models': {
+            const resDir = argVal('--resources');
+            if (!resDir) { err('--resources is required (Claude Desktop resources/ dir)'); process.exit(2); }
+            if (!fs.existsSync(path.resolve(resDir))) { err(`Not found: ${resDir}`); process.exit(2); }
+            inf(`Renderer model-name patch: ${path.resolve(resDir)}`);
+            if (!patchIonDistModels(path.resolve(resDir), { resultId: 'renderer-models' })) process.exit(1);
             return;
         }
         case 'locale': {
